@@ -108,19 +108,50 @@ class CellDataset(Dataset):
         return self.transform(image), self.label_to_index[row.label]
 
 
-def make_loaders(train: pd.DataFrame, val: pd.DataFrame, test: pd.DataFrame, image_size: int, batch_size: int, workers: int):
+class CellPreprocessor:
+    """Optional image cleanup performed in memory, leaving raw files untouched."""
+
+    def __init__(self, color_normalization: bool, remove_background: bool, background_threshold: int) -> None:
+        self.color_normalization = color_normalization
+        self.remove_background = remove_background
+        self.background_threshold = background_threshold / 255.0
+
+    def __call__(self, image: Image.Image) -> Image.Image:
+        pixels = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
+        foreground = pixels.mean(axis=2) < self.background_threshold
+        if self.color_normalization and foreground.any():
+            channel_mean = pixels[foreground].mean(axis=0)
+            pixels = np.clip(pixels * (channel_mean.mean() / np.maximum(channel_mean, 1e-6)), 0.0, 1.0)
+        if self.remove_background:
+            pixels[~foreground] = 0.0
+        return Image.fromarray((pixels * 255).round().astype(np.uint8), mode="RGB")
+
+
+def make_loaders(train: pd.DataFrame, val: pd.DataFrame, test: pd.DataFrame, image_size: int, batch_size: int, workers: int, color_normalization: bool, remove_background: bool, background_threshold: int):
     # These transforms are in-memory model input preparation, not preprocessing of raw files.
-    input_transform = transforms.Compose([
+    cleanup = CellPreprocessor(color_normalization, remove_background, background_threshold)
+    evaluation_transform = transforms.Compose([
+        cleanup,
         transforms.Resize((image_size, image_size), antialias=True),
+        transforms.ToTensor(),
+        transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+    ])
+    training_transform = transforms.Compose([
+        cleanup,
+        transforms.Resize((image_size, image_size), antialias=True),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomVerticalFlip(),
+        transforms.RandomRotation(20),
+        transforms.ColorJitter(brightness=0.15, contrast=0.15),
         transforms.ToTensor(),
         transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
     ])
     pin_memory = torch.cuda.is_available()
     options = {"batch_size": batch_size, "num_workers": workers, "pin_memory": pin_memory}
     return (
-        DataLoader(CellDataset(train, input_transform), shuffle=True, **options),
-        DataLoader(CellDataset(val, input_transform), shuffle=False, **options),
-        DataLoader(CellDataset(test, input_transform), shuffle=False, **options),
+        DataLoader(CellDataset(train, training_transform), shuffle=True, **options),
+        DataLoader(CellDataset(val, evaluation_transform), shuffle=False, **options),
+        DataLoader(CellDataset(test, evaluation_transform), shuffle=False, **options),
     )
 
 
@@ -146,15 +177,30 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/efficientnet_b0"))
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--image-size", type=int, default=224)
+    parser.add_argument("--image-size", type=int, choices=(256, 512), default=256)
+    parser.add_argument("--color-normalization", action="store_true", help="Apply in-memory gray-world colour normalization.")
+    parser.add_argument("--remove-background", action="store_true", help="Mask near-white background pixels in memory.")
+    parser.add_argument("--background-threshold", type=int, default=245, help="Pixels lighter than this (0-255) are background.")
     parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--workers", type=int, default=0, help="Use 0 on Windows unless worker processes are needed.")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+    if not 0 <= args.background_threshold <= 255:
+        parser.error("--background-threshold must be between 0 and 255")
 
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    preprocessing = {
+        "resize": [args.image_size, args.image_size],
+        "pixel_scaling": "ToTensor scales RGB values to [0, 1] before ImageNet normalization",
+        "color_normalization": args.color_normalization,
+        "background_removal": args.remove_background,
+        "background_threshold": args.background_threshold,
+        "training_augmentation": "horizontal/vertical flips, rotation up to 20 degrees, brightness and contrast jitter",
+    }
+    with (args.output_dir / "preprocessing.json").open("w", encoding="utf-8") as file:
+        json.dump(preprocessing, file, indent=2)
 
     frame = discover_cropped_images(args.data_dir)
     train, val, test = stratified_splits(frame, args.seed)
@@ -164,7 +210,7 @@ def main() -> None:
     print(f"Split sizes — train: {len(train)}, validation: {len(val)}, test: {len(test)}")
     print("Note: these are image-level splits, not patient-level clinical validation.")
 
-    train_loader, val_loader, test_loader = make_loaders(train, val, test, args.image_size, args.batch_size, args.workers)
+    train_loader, val_loader, test_loader = make_loaders(train, val, test, args.image_size, args.batch_size, args.workers, args.color_normalization, args.remove_background, args.background_threshold)
     weights = models.EfficientNet_B0_Weights.IMAGENET1K_V1
     model = models.efficientnet_b0(weights=weights)
     model.classifier[1] = nn.Linear(model.classifier[1].in_features, len(CLASS_NAMES))
